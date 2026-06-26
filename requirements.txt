@@ -1,0 +1,19 @@
+# Core ML / numerics
+torch>=2.1.0
+numpy>=1.24
+
+# ECMWF / Anemoi stack
+anemoi-inference>=0.4
+earthkit-data>=0.10
+earthkit-regrid>=0.2
+ecmwf-opendata>=0.3
+
+# SSL certificates (needed on macOS)
+certifi
+
+# Visualisation
+matplotlib>=3.7
+cartopy>=0.22
+
+# Optional — only needed if you run the Gradio demo
+# gradio>=4.0
