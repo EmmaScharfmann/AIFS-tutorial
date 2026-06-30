@@ -22,9 +22,7 @@ class ModelConfig:
 
     variant: ModelVariant
 
-    # Surface params fetched *with* ensemble perturbation (or all of them for Single)
     param_sfc: list[str] = field(default_factory=list)
-    # Constant/static surface params fetched *without* a member number (ENS only)
     param_sfc_const: list[str] = field(default_factory=list)
 
     param_wave: list[str] = field(default_factory=list)
@@ -34,13 +32,11 @@ class ModelConfig:
     levels: list[int] = field(default_factory=list)
     soil_levels: list[int] = field(default_factory=list)
 
-    # Pressure levels for which q is *not* used by the model
     q_levels_drop: list[int] = field(default_factory=list)
 
 
 G = 9.80665
 
-# Shared across both variants
 _PARAM_WAVE = [
     "wmb",
     "h1012",
@@ -76,13 +72,13 @@ CONFIGS: dict[ModelVariant, ModelConfig] = {
             "sdor",
             "sd",
         ],
-        param_sfc_const=[],  # Single fetches everything in one call
+        param_sfc_const=[],
         param_wave=_PARAM_WAVE,
         param_soil=_PARAM_SOIL,
         param_pl=["gh", "t", "u", "v", "q"],
         levels=_LEVELS,
         soil_levels=_SOIL_LEVELS,
-        q_levels_drop=[10, 50],  # Single drops both 10 hPa and 50 hPa q
+        q_levels_drop=[10, 50],
     ),
     "ens": ModelConfig(
         variant="ens",
@@ -97,13 +93,13 @@ CONFIGS: dict[ModelVariant, ModelConfig] = {
             "tcw",
             "sd",
         ],
-        param_sfc_const=["lsm", "z", "slor", "sdor"],  # Fetched without member
+        param_sfc_const=["lsm", "z", "slor", "sdor"],
         param_wave=_PARAM_WAVE,
         param_soil=_PARAM_SOIL,
-        param_pl=["gh", "t", "u", "v", "w", "q"],  # ENS adds "w"
+        param_pl=["gh", "t", "u", "v", "w", "q"],
         levels=_LEVELS,
         soil_levels=_SOIL_LEVELS,
-        q_levels_drop=[10],  # ENS only drops 10 hPa q
+        q_levels_drop=[10],
     ),
 }
 
@@ -117,12 +113,14 @@ DEFAULT_CACHE_DIR = Path("ic_cache")
 def _cache_path(
     date: datetime.datetime, variant: ModelVariant, cache_dir: Path
 ) -> Path:
+    """Build the cache path from the variable and date"""
     return cache_dir / f"ic_{variant}_{date.strftime('%Y%m%dT%H%M%S')}.npz"
 
 
 def _save(
     date: datetime.datetime, variant: ModelVariant, fields: dict, cache_dir: Path
 ) -> Path:
+    """Save the data in cache. The path is constructed from the variable and date."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = _cache_path(date, variant, cache_dir)
     np.savez_compressed(str(path), **fields)
@@ -130,7 +128,7 @@ def _save(
 
 
 def _try_load(date: datetime.datetime, variant: ModelVariant, cache_dir: Path):
-    """Return ``(fields_dict, path)`` if cached, else ``(None, None)``."""
+    """Try to load the data from ECMWF. Return ``(fields_dict, path)`` if cached, else ``(None, None)``."""
     path = _cache_path(date, variant, cache_dir)
     if path.exists():
         return dict(np.load(str(path))), path
@@ -207,7 +205,6 @@ def _build_fields(
 
     if cfg.param_sfc_const:
         print("  ⬇  Constant surface fields …")
-        # Fetched without a member number — these are deterministic/static
         fields.update(_fetch_fields(ekd, ekr, date, cfg.param_sfc_const, levtype="sfc"))
 
     # ── Wave ──────────────────────────────────────────────────────────────────
@@ -231,7 +228,6 @@ def _build_fields(
 
     # ── Transformations ───────────────────────────────────────────────────────
 
-    # Wave direction → sin/cos components
     mwd = fields.pop("mwd")
     mwd_rad = np.deg2rad(mwd)
     fields["cos_mwd"] = np.cos(mwd_rad)
@@ -259,7 +255,7 @@ def _build_fields(
             if var in fields:
                 fields[var][:, ocean_mask] = np.nan
     except Exception:
-        pass  # lsm.grib not found; skip masking
+        pass
 
     for level in cfg.levels:
         gh = fields.pop(f"gh_{level}", None)

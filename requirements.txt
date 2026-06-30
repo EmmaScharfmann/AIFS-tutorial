@@ -16,3 +16,6 @@ certifi
 
 matplotlib>=3.7
 cartopy>=0.22
+
+jupyter
+

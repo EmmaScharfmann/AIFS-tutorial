@@ -6,3 +6,5 @@
 .DS_Store
 __pycache__
 ic_cache
+.venv/
+*.png
