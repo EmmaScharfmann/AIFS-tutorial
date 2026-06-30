@@ -1,7 +1,9 @@
 import datetime
 import warnings
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -9,27 +11,101 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# ── Meteorological variable lists ─────────────────────────────────────────────
+# ── Model configuration ───────────────────────────────────────────────────────
 
-#: Surface parameters (levtype=sfc)
-PARAM_SFC = [
-    "10u", "10v", "2d", "2t", "msl", "skt", "sp",
-    "tcw", "lsm", "z", "slor", "sdor", "sd",
+ModelVariant = Literal["single", "ens"]
+
+
+@dataclass
+class ModelConfig:
+    """Describes what data a given AIFS variant needs."""
+
+    variant: ModelVariant
+
+    # Surface params fetched *with* ensemble perturbation (or all of them for Single)
+    param_sfc: list[str] = field(default_factory=list)
+    # Constant/static surface params fetched *without* a member number (ENS only)
+    param_sfc_const: list[str] = field(default_factory=list)
+
+    param_wave: list[str] = field(default_factory=list)
+    param_soil: list[str] = field(default_factory=list)
+    param_pl: list[str] = field(default_factory=list)
+
+    levels: list[int] = field(default_factory=list)
+    soil_levels: list[int] = field(default_factory=list)
+
+    # Pressure levels for which q is *not* used by the model
+    q_levels_drop: list[int] = field(default_factory=list)
+
+
+G = 9.80665
+
+# Shared across both variants
+_PARAM_WAVE = [
+    "wmb",
+    "h1012",
+    "h1214",
+    "h1417",
+    "h1721",
+    "h2125",
+    "h2530",
+    "mwd",
+    "cdww",
+    "mwp",
+    "swh",
 ]
+_PARAM_SOIL = ["vsw", "sot"]
+_SOIL_LEVELS = [1, 2]
+_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50, 10]
 
-#: Soil parameters (levtype=sfc, levelist=[1,2])
-PARAM_SOIL = ["vsw", "sot"]
-SOIL_LEVELS = [1, 2]
-
-#: Ocean-wave parameters (stream=wave)
-PARAM_WAVE = [
-    "wmb", "h1012", "h1214", "h1417", "h1721",
-    "h2125", "h2530", "mwd", "cdww", "mwp", "swh",
-]
-
-#: Pressure-level parameters
-PARAM_PL = ["gh", "t", "u", "v", "q"]
-LEVELS   = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50, 10]
+CONFIGS: dict[ModelVariant, ModelConfig] = {
+    "single": ModelConfig(
+        variant="single",
+        param_sfc=[
+            "10u",
+            "10v",
+            "2d",
+            "2t",
+            "msl",
+            "skt",
+            "sp",
+            "tcw",
+            "lsm",
+            "z",
+            "slor",
+            "sdor",
+            "sd",
+        ],
+        param_sfc_const=[],  # Single fetches everything in one call
+        param_wave=_PARAM_WAVE,
+        param_soil=_PARAM_SOIL,
+        param_pl=["gh", "t", "u", "v", "q"],
+        levels=_LEVELS,
+        soil_levels=_SOIL_LEVELS,
+        q_levels_drop=[10, 50],  # Single drops both 10 hPa and 50 hPa q
+    ),
+    "ens": ModelConfig(
+        variant="ens",
+        param_sfc=[
+            "10u",
+            "10v",
+            "2d",
+            "2t",
+            "msl",
+            "skt",
+            "sp",
+            "tcw",
+            "sd",
+        ],
+        param_sfc_const=["lsm", "z", "slor", "sdor"],  # Fetched without member
+        param_wave=_PARAM_WAVE,
+        param_soil=_PARAM_SOIL,
+        param_pl=["gh", "t", "u", "v", "w", "q"],  # ENS adds "w"
+        levels=_LEVELS,
+        soil_levels=_SOIL_LEVELS,
+        q_levels_drop=[10],  # ENS only drops 10 hPa q
+    ),
+}
 
 SOURCE = "ecmwf"
 
@@ -38,20 +114,24 @@ SOURCE = "ecmwf"
 DEFAULT_CACHE_DIR = Path("ic_cache")
 
 
-def _cache_path(date: datetime.datetime, cache_dir: Path) -> Path:
-    return cache_dir / f"ic_{date.strftime('%Y%m%dT%H%M%S')}.npz"
+def _cache_path(
+    date: datetime.datetime, variant: ModelVariant, cache_dir: Path
+) -> Path:
+    return cache_dir / f"ic_{variant}_{date.strftime('%Y%m%dT%H%M%S')}.npz"
 
 
-def _save(date: datetime.datetime, fields: dict, cache_dir: Path) -> Path:
+def _save(
+    date: datetime.datetime, variant: ModelVariant, fields: dict, cache_dir: Path
+) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    path = _cache_path(date, cache_dir)
+    path = _cache_path(date, variant, cache_dir)
     np.savez_compressed(str(path), **fields)
     return path
 
 
-def _try_load(date: datetime.datetime, cache_dir: Path):
+def _try_load(date: datetime.datetime, variant: ModelVariant, cache_dir: Path):
     """Return ``(fields_dict, path)`` if cached, else ``(None, None)``."""
-    path = _cache_path(date, cache_dir)
+    path = _cache_path(date, variant, cache_dir)
     if path.exists():
         return dict(np.load(str(path))), path
     return None, None
@@ -66,60 +146,92 @@ def list_cached(cache_dir: Path = DEFAULT_CACHE_DIR) -> list[Path]:
 
 # ── Download helpers ──────────────────────────────────────────────────────────
 
-def _fetch_fields(ekd, ekr, date, param, levelist=None, **kwargs) -> dict:
+
+def _fetch_fields(ekd, ekr, date, param, levelist=None, number=None, **kwargs) -> dict:
     """
     Download ``param`` for two time-steps (t-6h, t) and return a dict
     ``{variable_name: np.ndarray shape (2, N320_nodes)}``.
+
+    Parameters
+    ----------
+    number:
+        Ensemble member index (1–50). ``None`` for deterministic / control
+        runs or constant fields that have no perturbation.
     """
     levelist = levelist or []
     raw: dict[str, list] = defaultdict(list)
 
     for t in [date - datetime.timedelta(hours=6), date]:
+        fetch_kwargs = dict(kwargs)
+        if number is not None:
+            fetch_kwargs.setdefault("stream", "enfo")
+            fetch_kwargs["number"] = [number]
+
         dataset = ekd.from_source(
             "ecmwf-open-data",
             date=t,
             param=param,
             levelist=levelist,
             source=SOURCE,
-            **kwargs,
+            **fetch_kwargs,
         )
-        for field in dataset:
-            assert field.to_numpy().shape == (721, 1440), (
-                f"Unexpected grid shape for {field.metadata('param')}: "
-                f"{field.to_numpy().shape}"
+        for f in dataset:
+            assert f.to_numpy().shape == (721, 1440), (
+                f"Unexpected grid shape for {f.metadata('param')}: "
+                f"{f.to_numpy().shape}"
             )
-            # Shift lon from [0,360) to [-180,180) then regrid to N320 Gaussian
-            values = np.roll(field.to_numpy(), -field.shape[1] // 2, axis=1)
+            values = np.roll(f.to_numpy(), -f.shape[1] // 2, axis=1)
             values = ekr.interpolate(values, {"grid": (0.25, 0.25)}, {"grid": "N320"})
 
-            if levelist:
-                name = f"{field.metadata('param')}_{field.metadata('levelist')}"
-            else:
-                name = field.metadata("param")
+            name = (
+                f"{f.metadata('param')}_{f.metadata('levelist')}"
+                if levelist
+                else f.metadata("param")
+            )
             raw[name].append(values)
 
     return {k: np.stack(v) for k, v in raw.items()}
 
 
-def _build_fields(ekd, ekr, date: datetime.datetime) -> dict:
+def _build_fields(
+    ekd, ekr, date: datetime.datetime, cfg: ModelConfig, number=None
+) -> dict:
     """Download and transform all required fields for ``date``."""
     fields: dict = {}
 
+    # ── Surface ───────────────────────────────────────────────────────────────
     print("  ⬇  Surface fields …")
-    fields.update(_fetch_fields(ekd, ekr, date, PARAM_SFC, levtype="sfc"))
+    fields.update(
+        _fetch_fields(ekd, ekr, date, cfg.param_sfc, number=number, levtype="sfc")
+    )
 
+    if cfg.param_sfc_const:
+        print("  ⬇  Constant surface fields …")
+        # Fetched without a member number — these are deterministic/static
+        fields.update(_fetch_fields(ekd, ekr, date, cfg.param_sfc_const, levtype="sfc"))
+
+    # ── Wave ──────────────────────────────────────────────────────────────────
     print("  ⬇  Wave fields …")
-    fields.update(_fetch_fields(ekd, ekr, date, PARAM_WAVE, stream="wave"))
+    wave_stream = "waef" if (cfg.variant == "ens" and number is not None) else "wave"
+    fields.update(
+        _fetch_fields(ekd, ekr, date, cfg.param_wave, number=number, stream=wave_stream)
+    )
 
+    # ── Soil ──────────────────────────────────────────────────────────────────
     print("  ⬇  Soil fields …")
-    soil = _fetch_fields(ekd, ekr, date, PARAM_SOIL, levelist=SOIL_LEVELS)
+    soil = _fetch_fields(
+        ekd, ekr, date, cfg.param_soil, levelist=cfg.soil_levels, number=number
+    )
 
+    # ── Pressure levels ───────────────────────────────────────────────────────
     print("  ⬇  Pressure-level fields …")
-    fields.update(_fetch_fields(ekd, ekr, date, PARAM_PL, levelist=LEVELS))
+    fields.update(
+        _fetch_fields(ekd, ekr, date, cfg.param_pl, levelist=cfg.levels, number=number)
+    )
 
     # ── Transformations ───────────────────────────────────────────────────────
 
-    # Wave direction: decompose scalar angle into sin/cos components
+    # Wave direction → sin/cos components
     mwd = fields.pop("mwd")
     mwd_rad = np.deg2rad(mwd)
     fields["cos_mwd"] = np.cos(mwd_rad)
@@ -127,17 +239,19 @@ def _build_fields(ekd, ekr, date: datetime.datetime) -> dict:
 
     # Rename soil fields to ECMWF short-names expected by AIFS
     _soil_rename = {
-        "sot_1": "stl1",  "sot_2": "stl2",
-        "vsw_1": "swvl1", "vsw_2": "swvl2",
+        "sot_1": "stl1",
+        "sot_2": "stl2",
+        "vsw_1": "swvl1",
+        "vsw_2": "swvl2",
     }
     for src, dst in _soil_rename.items():
         fields[dst] = soil[src]
 
-    # Remove q levels that AIFS does not use
-    fields.pop("q_10", None)
-    fields.pop("q_50", None)
+    # Drop q levels not used by this model variant
+    for lev in cfg.q_levels_drop:
+        fields.pop(f"q_{lev}", None)
 
-    # Apply land-sea mask to snow depth and soil moisture (ocean → NaN)
+    # Land-sea mask: set ocean points to NaN for snow depth and soil moisture
     try:
         lsm = ekd.from_source("file", "lsm.grib")[0].to_numpy(flatten=True)
         ocean_mask = np.equal(lsm, 0)
@@ -147,9 +261,7 @@ def _build_fields(ekd, ekr, date: datetime.datetime) -> dict:
     except Exception:
         pass  # lsm.grib not found; skip masking
 
-    # Convert geopotential height → geopotential  (Z = gh × g)
-    G = 9.80665
-    for level in LEVELS:
+    for level in cfg.levels:
         gh = fields.pop(f"gh_{level}", None)
         if gh is not None:
             fields[f"z_{level}"] = gh * G
@@ -159,7 +271,10 @@ def _build_fields(ekd, ekr, date: datetime.datetime) -> dict:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+
 def load_ics(
+    variant: ModelVariant = "single",
+    number: int | None = None,
     cache_dir: Path | str = DEFAULT_CACHE_DIR,
     force: bool = False,
 ) -> tuple[dict, datetime.datetime]:
@@ -168,6 +283,11 @@ def load_ics(
 
     Parameters
     ----------
+    variant:
+        ``"single"`` for AIFS Single 2.0, ``"ens"`` for AIFS ENS 2.0.
+    number:
+        Ensemble member (1–50). ``None`` → control / deterministic run.
+        Ignored when ``variant="single"``.
     cache_dir:
         Directory where .npz caches are stored.
     force:
@@ -189,20 +309,31 @@ def load_ics(
     ekd.config.set({"cache-policy": "user"})
     cache_dir = Path(cache_dir)
 
+    if variant not in CONFIGS:
+        raise ValueError(f"Unknown variant {variant!r}. Choose from: {list(CONFIGS)}")
+
+    cfg = CONFIGS[variant]
+
+    # ENS-only: normalise number
+    member = number if variant == "ens" else None
+
     date: datetime.datetime = OpendataClient(SOURCE).latest()
-    print(f"📅  Latest ECMWF run: {date}")
+    print(f"📅  Latest ECMWF run : {date}")
+    print(
+        f"🤖  Model variant    : {variant}" + (f"  (member {member})" if member else "")
+    )
 
     if not force:
-        cached, path = _try_load(date, cache_dir)
+        cached, path = _try_load(date, variant, cache_dir)
         if cached is not None:
             sz_mb = path.stat().st_size / 1e6
             print(f"✅  Loaded from cache  ({sz_mb:.0f} MB)  →  {path}")
             return cached, date
 
     print("⬇️   Downloading initial conditions …")
-    fields = _build_fields(ekd, ekr, date)
+    fields = _build_fields(ekd, ekr, date, cfg, number=member)
 
-    path = _save(date, fields, cache_dir)
+    path = _save(date, variant, fields, cache_dir)
     sz_mb = path.stat().st_size / 1e6
     print(f"💾  Saved to {path}  ({sz_mb:.0f} MB)")
 

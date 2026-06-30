@@ -1,19 +1,18 @@
-# Core ML / numerics
 torch>=2.1.0
 numpy>=1.24
+huggingface_hub
 
-# ECMWF / Anemoi stack
-anemoi-inference>=0.4
+anemoi-models==0.9.3
+anemoi-transform==0.4.2
+anemoi-datasets==0.5.26
+anemoi-graphs==0.6.4
+anemoi-inference
+
 earthkit-data>=0.10
 earthkit-regrid>=0.2
 ecmwf-opendata>=0.3
 
-# SSL certificates (needed on macOS)
 certifi
 
-# Visualisation
 matplotlib>=3.7
 cartopy>=0.22
-
-# Optional — only needed if you run the Gradio demo
-# gradio>=4.0

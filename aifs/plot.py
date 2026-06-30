@@ -149,7 +149,6 @@ def plot_field(
     -------
     matplotlib.figure.Figure
     """
-    import matplotlib
     import matplotlib.pyplot as plt
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature

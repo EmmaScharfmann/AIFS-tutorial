@@ -1,42 +1,23 @@
----
-title: "Running ECMWF AIFS on Any Machine — No Ampere GPU Required"
-thumbnail: https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/aifs-tutorial/thumbnail.png
-authors:
-  - user: your-hf-username
-tags:
-  - weather
-  - climate
-  - aifs
-  - anemoi
-  - ecmwf
-  - forecasting
----
+# Running ECMWF AIFS using CUDA or Apple MPS or CPU
 
-# Running ECMWF AIFS on Any Machine — No Ampere GPU Required
+ECMWF has released its AIFS weights on Hugging Face, including the current [aifs-single-2.0](https://huggingface.co/ecmwf/aifs-single-2.0) checkpoint. 
+AIFS is a data-driven medium-range forecasting model trained on ECMWF's ERA5 reanalysis and operational NWP analyses, and is described in [Lang et al. (2024)](https://arxiv.org/abs/2406.01465).
 
-ECMWF's [AIFS](https://www.ecmwf.int/en/about/media-centre/aifs-machine-learning-weather-model)
-(Artificial Intelligence Forecast System) is one of the most accurate
-operational weather models ever built.  It consistently outperforms
-traditional numerical weather prediction at medium range and runs in
-seconds rather than hours.
+To generate a forecast from the published weights, ECMWF's documentation points to ```anemoi-inference```.
+However, ```anemoi-inference``` default installation depends on [`flash-attn`](https://github.com/Dao-AILab/flash-attention), 
+which only compiles on **Ampere-class NVIDIA GPUs** (A100, H100, RTX 30xx+).
+For anyone without that specific hardware, installing ```flash-attn``` and dealing with ```anemoi``` dependencies are the main barriers to running inference.
 
-The problem?  The official implementation depends on
-[`flash-attn`](https://github.com/Dao-AILab/flash-attention), a library
-that only compiles on **Ampere-class NVIDIA GPUs** (A100, H100, RTX 30xx+).
-For most researchers and practitioners — especially those working on
-older clusters, Apple Silicon, or CPU-only machines — this is a hard wall.
-
-This tutorial shows you how to get around it with a **pure-PyTorch SDPA
-shim** that makes AIFS run on any hardware.
+Therefore, we developed this tutorial and a lightweight wrapper to simplify running [aifs-single-2.0](https://huggingface.co/ecmwf/aifs-single-2.0) with ```anemoi-inference``` on any hardware.
 
 ---
 
-## Why AIFS Needs flash-attn (And Why It Doesn't Have To)
+## Why does ```anemoi-inference``` rely on  ```flash-attn```
 
 AIFS uses a **sliding-window graph-transformer** architecture.  Each
 attention layer calls `flash_attn_func` from the `flash-attn` package,
-which fuses the softmax and matrix multiplications into a single CUDA
-kernel — fast, memory-efficient, and Ampere-only.
+which computes the softmax and matrix multiplications into a single CUDA
+kernel — fast, memory-efficient, and **Ampere-only**.
 
 PyTorch 2.1+ ships its own fused attention via
 `torch.nn.functional.scaled_dot_product_attention` (SDPA), which:
@@ -45,15 +26,14 @@ PyTorch 2.1+ ships its own fused attention via
 - Falls back gracefully to memory-efficient attention or naive attention
 - Works on CUDA, Apple MPS, and CPU
 
-Our shim intercepts Anemoi's `flash_attn` import and routes it to SDPA
-— no recompilation, no CUDA toolkit required.
+Our wrapper intercepts Anemoi's `flash_attn` import and routes it to SDPA.
 
 ---
 
 ## Setup
 
 ```bash
-git clone https://huggingface.co/datasets/YOUR_USERNAME/aifs-tutorial
+git clone https://github.com/EmmaScharfmann/AIFS-tutorial
 cd aifs-tutorial
 pip install -r requirements.txt
 ```
@@ -62,58 +42,93 @@ pip install -r requirements.txt
 
 **requirements.txt** (key packages):
 ```
-torch>=2.1.0
-anemoi-inference>=0.4
-earthkit-data>=0.10
-earthkit-regrid>=0.2
-ecmwf-opendata>=0.3
-cartopy>=0.22
+torch==2.11.0
+anemoi-models==0.9.3
+anemoi-transform==0.4.2
+anemoi-datasets==0.5.26
+anemoi-graphs==0.6.4
+anemoi-inference
 ```
 
 ---
 
-## How the Shim Works
+## How it works
 
-The shim lives in `aifs/compat.py`.  It creates a fake `flash_attn`
+The wrapper lives in `aifs/compat.py`.  It creates a fake `flash_attn`
 module tree and registers it in `sys.modules` *before* any Anemoi import
 can trigger the real package lookup:
 
 ```python
-# aifs/compat.py  (simplified)
+# aifs/compat.py 
+import torch
 import sys, types
 import torch.nn.functional as F
 
-def _sdpa_compat(q, k, v, window_size=(-1,-1), dropout_p=0.0):
-    # flash-attn layout:  (B, S, H, D)
-    # SDPA layout:        (B, H, S, D)
+# overwrites _sdpa_compat
+def _sdpa_compat(q, k, v, causal=False, window_size=(-1, -1), dropout_p=0.0, softcap=None, alibi_slopes=None):
+    """
+    Drop-in replacement for ``flash_attn_func``.
+
+    Parameters mirror the flash-attn 2.x signature that Anemoi calls.
+    Input tensors are shaped ``(batch, seq, heads, dim)``.
+    """
+    # flash-attn layout: (B, S, H, D)  →  SDPA layout: (B, H, S, D)
     q, k, v = (t.permute(0, 2, 1, 3) for t in (q, k, v))
-    ws = window_size[0]
+    ws = window_size[0] if isinstance(window_size, (tuple, list)) else int(window_size)
 
     if q.device.type == "cuda":
-        out = F.scaled_dot_product_attention(q, k, v)
+        # Full global attention; SDPA dispatches to flash-attn kernel when available
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
     elif ws > 0:
-        # MPS: chunked sliding-window to avoid OOM
+        # MPS: chunked sliding-window attention (avoids OOM on large sequences)
         B, H, S, D = q.shape
         out = torch.zeros_like(q)
         for i in range(0, S, ws):
-            out[:, :, i:i+ws] = F.scaled_dot_product_attention(
-                q[:, :, i:i+ws],
-                k[:, :, max(0,i-ws):min(S,i+2*ws)],
-                v[:, :, max(0,i-ws):min(S,i+2*ws)],
+            k_start = max(0, i - ws)
+            k_end   = min(S, i + ws + ws)
+            out[:, :, i : i + ws] = F.scaled_dot_product_attention(
+                q[:, :, i : i + ws],
+                k[:, :, k_start:k_end],
+                v[:, :, k_start:k_end],
+                dropout_p=dropout_p,
             )
+
     else:
-        out = F.scaled_dot_product_attention(q.cpu(), k.cpu(), v.cpu())
+        # CPU fallback — move to CPU in case tensors are on an unsupported device
+        out = F.scaled_dot_product_attention(
+            q.cpu(), k.cpu(), v.cpu(), dropout_p=dropout_p
+        ).to(q.device)
 
     return out.permute(0, 2, 1, 3)
 
-# Register stub before any anemoi import
-fake_mod = types.ModuleType("flash_attn.flash_attn_interface")
-fake_mod.flash_attn_func = _sdpa_compat
-sys.modules["flash_attn.flash_attn_interface"] = fake_mod
+def _patch():
+    """Install the flash_attn stub into ``sys.modules``."""
+    if "flash_attn" in sys.modules:
+        return
+
+    flash_attn = types.ModuleType("flash_attn")
+    flash_attn.__version__ = "2.6.0"  # version Anemoi checks against
+
+    # flash_attn.layers.rotary  
+    layers_mod = types.ModuleType("flash_attn.layers")
+    rotary_mod = types.ModuleType("flash_attn.layers.rotary")
+    rotary_mod.RotaryEmbedding = None
+    layers_mod.rotary = rotary_mod
+    flash_attn.layers = layers_mod
+
+    # flash_attn.flash_attn_interface  
+    interface_mod = types.ModuleType("flash_attn.flash_attn_interface")
+    interface_mod.flash_attn_func = _sdpa_compat
+    flash_attn.flash_attn_interface = interface_mod
+
+    sys.modules["flash_attn"]                    = flash_attn
+    sys.modules["flash_attn.layers"]             = layers_mod
+    sys.modules["flash_attn.layers.rotary"]      = rotary_mod
+    sys.modules["flash_attn.flash_attn_interface"] = interface_mod
 ```
 
-This is the entire trick.  Everything else is just plumbing.
+This code allows to run inference of AIFS on any GPU or CPU. 
 
 ---
 
@@ -142,17 +157,12 @@ fields, date = load_ics(cache_dir="../ic_cache")
 # First run: ~3–5 min download, saved to ic_cache/
 # Later runs: <1 s from local .npz cache
 
-print(date)  # 2025-01-15 00:00:00
-print(fields["2t"].shape)  # (2, 542080)  — two time-steps on the N320 grid
+print(date)  
+print(fields["2t"].shape)
 ```
 
-The function returns a plain dict of NumPy arrays.  Each array has shape
-`(2, N_nodes)` where the first axis indexes the two input time-steps and
-`N_nodes ≈ 542,080` is the size of the N320 reduced-Gaussian grid.
-
-**Fields downloaded**: surface (13 variables), soil (4), ocean waves (11),
-pressure levels (5 variables × 14 levels = 70), plus derived quantities
-(geopotential, wave direction components).
+**Fields downloaded**: surface, soil, ocean waves,
+pressure levels, plus derived quantities (geopotential, wave direction components).
 
 ### 3. Run a Forecast
 
@@ -162,19 +172,10 @@ from aifs import run_forecast
 states = run_forecast(
     fields,
     date,
-    lead_time=24,   # hours; must be multiple of 6
-    num_chunks=16,  # tune for your hardware (see table below)
+    lead_time=24,  
+    num_chunks=16, 
 )
 ```
-
-**Memory guide:**
-
-| RAM / VRAM | `num_chunks` |
-|---|---|
-| ≥ 40 GB | 4 |
-| 16–24 GB | 16 |
-| 8–12 GB | 32 |
-| < 8 GB / CPU | 64 |
 
 Each call to `run_forecast` returns a list of state dicts — one per
 6-hour output step:
@@ -239,18 +240,6 @@ for state in run_forecast_streaming(fields, date, lead_time=120):
 
 ---
 
-## Performance Expectations
-
-| Hardware | Time per 6h step | Notes |
-|---|---|---|
-| A100 / H100 | ~5–10 s | Near-operational speed |
-| RTX 3090 / 4090 | ~15–25 s | |
-| RTX 2080 Ti | ~30–50 s | Older Turing GPU, no flash-attn |
-| Apple M2 Pro | ~3–8 min | MPS chunked attention |
-| Modern CPU (16-core) | ~15–40 min | Practical for testing / CI |
-
----
-
 ## Repository Structure
 
 ```
@@ -264,6 +253,7 @@ aifs-tutorial/
 │   └── plot.py              # Cartopy-based visualisation
 ├── notebooks/
 │   └── tutorial.py          # This tutorial as a runnable notebook
+├── forecasts/               # Where your forecasts will be saved
 ├── run_forecast.py           # CLI entrypoint
 ├── requirements.txt
 └── README.md
@@ -271,65 +261,30 @@ aifs-tutorial/
 
 ---
 
-## Frequently Asked Questions
+## FAQ
 
-**Q: Do I need an ECMWF account?**
-No.  We use [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
+**Q: Where does the initial data come from?**
+We use [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
 which is freely available without registration under the CC-BY 4.0 license.
 
 **Q: Can I use AIFS Ensemble instead of AIFS Single?**
-Yes.  In `aifs/forecast.py`, add an entry to `CHECKPOINTS`:
+Yes, the compat.py patch method can be applied to AIFS ensemble.  In `aifs/forecast.py`, add an entry to `CHECKPOINTS`:
 ```python
-"aifs-ens-1.0": {"huggingface": "ecmwf/aifs-ens-1.0"},
+"aifs-ens-2.0": {"huggingface": "ecmwf/aifs-ens-2.0"},
 ```
-Then pass `checkpoint="aifs-ens-1.0"` to `run_forecast()`.
+Then pass `checkpoint="aifs-ens-2.0"` to `run_forecast()`.
+However, the checkpoints were not trained with the same version of the different anemoi-packages. The requirements must be adapted accordingly.  
 
-**Q: The model checkpoint is huge — where is it downloaded?**
+**Q: What is the size of the AIFs model and where is it stored?**
 Hugging Face caches it under `~/.cache/huggingface/hub/`.
 The AIFS Single v2 checkpoint is ~4 GB.
 
-**Q: How do I export to NetCDF for use with xarray?**
-Regrid from N320 back to a regular lat/lon grid with `earthkit-regrid`,
-then write with `xarray` + `netCDF4`:
-```python
-import earthkit.regrid as ekr
-import xarray as xr
-import numpy as np
-
-# Regrid one field from N320 to 0.25° regular grid
-data_ll = ekr.interpolate(
-    states[0]["fields"]["2t"],
-    {"grid": "N320"},
-    {"grid": (0.25, 0.25)},
-)
-lats = np.arange(90, -90.25, -0.25)
-lons = np.arange(0, 360, 0.25)
-da = xr.DataArray(data_ll, dims=["lat", "lon"],
-                  coords={"lat": lats, "lon": lons})
-da.to_netcdf("t2m_T+6h.nc")
-```
-
 **Q: My MPS run crashes with an out-of-memory error.**
-Increase `num_chunks` (e.g. 64 or 128) and make sure no other GPU
+Increase `num_chunks` (e.g. 64 or 128) to reduce the memory usage and make sure no other GPU
 workloads are running.
 
 ---
 
-## Citation
-
-If you use AIFS in your research, please cite the ECMWF technical note:
-
-```bibtex
-@techreport{lang2024aifs,
-  title   = {AIFS -- ECMWF's data-driven forecasting system},
-  author  = {Lang, Simon and others},
-  year    = {2024},
-  institution = {ECMWF},
-  url     = {https://arxiv.org/abs/2406.01465}
-}
-```
-
----
 
 *This tutorial is community-contributed and is not officially affiliated
 with ECMWF.  The AIFS model weights are distributed by ECMWF under their
