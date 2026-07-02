@@ -1,34 +1,3 @@
-#!/usr/bin/env python3
-"""
-run_forecast.py — CLI wrapper for AIFS forecasting
-===================================================
-
-Usage examples
---------------
-# Basic 24-hour forecast, save plots to ./outputs/
-python run_forecast.py
-
-# 48-hour forecast with custom output directory
-python run_forecast.py --lead-time 48 --output-dir my_results
-
-# Force re-download of initial conditions
-python run_forecast.py --force-download
-
-# List what's already in the IC cache
-python run_forecast.py --list-cache
-
-Full option reference
----------------------
-    --lead-time      Forecast horizon in hours (default: 24, must be multiple of 6)
-    --num-chunks     Attention chunks; increase to save memory (default: 16)
-    --fields         Space-separated list of fields to plot (default: 2t msl tcw swh)
-    --output-dir     Where to write PNG files (default: ./outputs)
-    --cache-dir      Where to store / read IC caches (default: ./ic_cache)
-    --force-download Re-download ICs even when a cache exists
-    --list-cache     Print cached IC dates and exit
-    --no-plots       Skip plotting (useful for debugging / memory profiling)
-"""
-
 import argparse
 import sys
 from pathlib import Path
@@ -55,6 +24,10 @@ def parse_args():
                    help="Print cached IC dates and exit")
     p.add_argument("--no-plots",       action="store_true",
                    help="Skip generating plots")
+    p.add_argument("--dataset-repo", type=str, default=None,
+                   help="HF dataset repo id to upload results to, e.g. 'username/aifs-results'")
+    p.add_argument("--private", action="store_true", default=True,
+                   help="Create the dataset repo as private (default: True)")
     return p.parse_args()
 
 
@@ -68,7 +41,9 @@ def main():
     from aifs.initial_conditions import load_ics, list_cached
     from aifs.device import  device_label
     from aifs.forecast import run_forecast
-    from aifs.plot import  plot_field_sequence
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from aifs.plot import plot_field
 
     # ── List cache and exit ────────────────────────────────────────────────────
     if args.list_cache:
@@ -107,19 +82,66 @@ def main():
         num_chunks=args.num_chunks,
     )
 
-    # 3. Save plots
-    if not args.no_plots:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        for variable in args.fields:
-            try:
-                fig = plot_field_sequence(states, variable, max_steps=4)
-                out = args.output_dir / f"{variable}_{date.strftime('%Y%m%dT%H%M%S')}.png"
-                fig.savefig(out, dpi=150, bbox_inches="tight")
-                print(f"  📊  Saved  →  {out}")
-            except Exception as exc:
-                print(f"  ⚠️   Could not plot '{variable}': {exc}")
-
     print(f"\n✅  Forecast complete.  {len(states)} steps produced.")
+
+
+    # 3. Save the results
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = date.strftime("%Y%m%dT%H%M")
+    run_dir = args.output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n💾  Saving {len(states)} states to {run_dir} ...")
+
+    for state in states:
+        step_label = state["date"].strftime("%Y%m%dT%H%M")
+
+        # Raw field data, compressed — one .npz per output step
+        npz_path = run_dir / f"state_{step_label}.npz"
+        np.savez_compressed(
+            npz_path,
+            date=str(state["date"]),
+            latitudes=state["latitudes"],
+            longitudes=state["longitudes"],
+            **{f"field_{k}": v for k, v in state["fields"].items()},
+        )
+
+        # Plots, one PNG per requested field per step
+        if not args.no_plots:
+            for field in args.fields:
+                if field not in state["fields"]:
+                    print(f"  ⚠️  Field '{field}' not in forecast output, skipping plot.")
+                    continue
+                try:
+                    fig = plot_field(state, field)
+                    fig.savefig(run_dir / f"{field}_{step_label}.png", dpi=150, bbox_inches="tight")
+                    plt.close(fig)
+                except Exception as e:
+                    print(f"  ⚠️  Could not plot {field} at {step_label}: {e}")
+
+    print(f"✅  Saved {len(states)} states to {run_dir}")
+
+    # 4. Upload to a Hugging Face dataset repo
+    if args.dataset_repo:
+        from huggingface_hub import HfApi
+
+        print(f"\n☁️   Uploading results to dataset repo: {args.dataset_repo}")
+        api = HfApi()
+        api.create_repo(
+            args.dataset_repo,
+            repo_type="dataset",
+            exist_ok=True,
+            private=args.private,
+        )
+        api.upload_folder(
+            repo_id=args.dataset_repo,
+            repo_type="dataset",
+            folder_path=str(run_dir),
+            path_in_repo=f"forecasts/{run_id}",
+        )
+        print(f"✅  Uploaded → https://huggingface.co/datasets/{args.dataset_repo}/tree/main/forecasts/{run_id}")
+
+
 
 
 if __name__ == "__main__":
