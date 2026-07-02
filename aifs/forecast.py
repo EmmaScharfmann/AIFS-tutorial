@@ -25,13 +25,35 @@ def run_forecast(
     verbose: bool = True,
 ):
     """
-    Same as before, but now a generator.
+    Run an AIFS forecast and return all output states.
 
-    Yields
-    ------
-    str  -- progress messages
-    Final value (via StopIteration / return) is the list of state dicts.
-    Use `yield from` pattern below to capture it on the caller side.
+    Parameters
+    ----------
+    fields:
+        Initial-condition field dict as returned by ``load_ics()``.
+        Shape of each array: ``(2, N320_nodes)``.
+    date:
+        Forecast initialisation datetime.
+    lead_time:
+        Forecast horizon in hours. Must be a multiple of 6.
+    num_chunks:
+        Number of chunks for the attention computation.
+        Increase if you run out of memory; decrease for speed.
+        16 is a safe default for 16 GB RAM / VRAM.
+    checkpoint:
+        Key into ``CHECKPOINTS`` dict, or a raw ``{"huggingface": "..."}``
+        dict you can pass directly.
+    verbose:
+        Print step-by-step progress.
+
+    Returns
+    -------
+    list of state dicts, one per 6-hour output step.
+    Each state dict has at minimum:
+        ``state["date"]``   — output datetime
+        ``state["fields"]`` — ``{variable: np.ndarray}``
+        ``state["latitudes"]``
+        ``state["longitude"]``
     """
     if lead_time % 6 != 0:
         raise ValueError(f"lead_time must be a multiple of 6, got {lead_time}")
@@ -45,17 +67,17 @@ def run_forecast(
     os.environ["ANEMOI_INFERENCE_NUM_CHUNKS"] = str(num_chunks)
 
     if verbose:
-        yield "log", f"🖥️   Device  : {device_label()} \n\n Checkpoint: {checkpoint} \n\n Lead time : {lead_time} h  ({lead_time // 6} steps)"
+        print(f"🖥️   Device  : {device_label()} \n\n Checkpoint: {checkpoint} \n\n Lead time : {lead_time} h  ({lead_time // 6} steps)")
 
     ckpt = CHECKPOINTS.get(checkpoint, checkpoint)
 
     if verbose:
-        yield "log" , "🤖  Loading model …"
+        print("🤖  Loading model …")
 
     runner = SimpleRunner(ckpt)
 
     if verbose:
-        yield "log" , "🌍  Running inference …"
+        print("🌍  Running inference …")
 
     states: list[dict] = []
     input_state = {"fields": fields, "date": date}
@@ -67,13 +89,12 @@ def run_forecast(
             "longitudes": state["longitudes"]
         })
         if verbose:
-            yield "log", f"    ✓  {state['date']}"
+            print(f"    ✓  {state['date']}")
 
         if verbose:
-            yield "log", f"✅  Done — {len(states)} steps produced."
+            print(f"✅  Done — {len(states)} steps produced.")
 
-        yield "result", states
-
+    return states
 
 def run_forecast_streaming(
     fields: dict,
