@@ -1,4 +1,4 @@
-# Running ECMWF AIFS using CUDA or Apple MPS or CPU
+# Running ECMWF AIFS using CUDA or Apple MPS or CPU ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 
 ECMWF has released its AIFS weights on Hugging Face, including the current [aifs-single-2.0](https://huggingface.co/ecmwf/aifs-single-2.0) checkpoint. 
 AIFS is a data-driven medium-range forecasting model trained on ECMWF's ERA5 reanalysis and operational NWP analyses, and is described in [Lang et al. (2024)](https://arxiv.org/abs/2406.01465).
@@ -32,6 +32,8 @@ Our wrapper intercepts Anemoi's `flash_attn` import and routes it to SDPA.
 
 ## Setup
 
+**Requirements:** Python ≥3.11, <3.13
+
 ```bash
 git clone https://github.com/EmmaScharfmann/AIFS-tutorial
 cd aifs-tutorial
@@ -59,73 +61,41 @@ module tree and registers it in `sys.modules` *before* any Anemoi import
 can trigger the real package lookup:
 
 ```python
-# aifs/compat.py 
-import torch
-import sys, types
-import torch.nn.functional as F
-
-# overwrites _sdpa_compat
-def _sdpa_compat(q, k, v, causal=False, window_size=(-1, -1), dropout_p=0.0, softcap=None, alibi_slopes=None):
-    """
-    Drop-in replacement for ``flash_attn_func``.
-
-    Parameters mirror the flash-attn 2.x signature that Anemoi calls.
-    Input tensors are shaped ``(batch, seq, heads, dim)``.
-    """
-    # flash-attn layout: (B, S, H, D)  →  SDPA layout: (B, H, S, D)
-    q, k, v = (t.permute(0, 2, 1, 3) for t in (q, k, v))
-    ws = window_size[0] if isinstance(window_size, (tuple, list)) else int(window_size)
-
-    if q.device.type == "cuda":
-        # Full global attention; SDPA dispatches to flash-attn kernel when available
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-
-    elif ws > 0:
-        # MPS: chunked sliding-window attention (avoids OOM on large sequences)
-        B, H, S, D = q.shape
-        out = torch.zeros_like(q)
-        for i in range(0, S, ws):
-            k_start = max(0, i - ws)
-            k_end   = min(S, i + ws + ws)
-            out[:, :, i : i + ws] = F.scaled_dot_product_attention(
-                q[:, :, i : i + ws],
-                k[:, :, k_start:k_end],
-                v[:, :, k_start:k_end],
-                dropout_p=dropout_p,
-            )
-
-    else:
-        # CPU fallback — move to CPU in case tensors are on an unsupported device
-        out = F.scaled_dot_product_attention(
-            q.cpu(), k.cpu(), v.cpu(), dropout_p=dropout_p
-        ).to(q.device)
-
-    return out.permute(0, 2, 1, 3)
-
 def _patch():
     """Install the flash_attn stub into ``sys.modules``."""
     if "flash_attn" in sys.modules:
         return
 
     flash_attn = types.ModuleType("flash_attn")
-    flash_attn.__version__ = "2.6.0"  # version Anemoi checks against
+    flash_attn.__version__ = "2.6.0"  
+    flash_attn.flash_attn_func = _sdpa_compat  
 
-    # flash_attn.layers.rotary  
+    # flash_attn.layers.rotary  (imported but only used on specific GPU paths)
     layers_mod = types.ModuleType("flash_attn.layers")
     rotary_mod = types.ModuleType("flash_attn.layers.rotary")
-    rotary_mod.RotaryEmbedding = None
+
+    def _rotary_not_implemented(*args, **kwargs):
+        raise NotImplementedError(
+            "flash_attn.layers.rotary.RotaryEmbedding is not available in the SDPA "
+            "compatibility shim; this code path requires real flash-attn on CUDA."
+        )
+
+    rotary_mod.RotaryEmbedding = _rotary_not_implemented
     layers_mod.rotary = rotary_mod
     flash_attn.layers = layers_mod
 
-    # flash_attn.flash_attn_interface  
+    # flash_attn.flash_attn_interface  (the one Anemoi actually calls)
     interface_mod = types.ModuleType("flash_attn.flash_attn_interface")
     interface_mod.flash_attn_func = _sdpa_compat
     flash_attn.flash_attn_interface = interface_mod
 
-    sys.modules["flash_attn"]                    = flash_attn
-    sys.modules["flash_attn.layers"]             = layers_mod
-    sys.modules["flash_attn.layers.rotary"]      = rotary_mod
+    sys.modules["flash_attn"] = flash_attn
+    sys.modules["flash_attn.layers"] = layers_mod
+    sys.modules["flash_attn.layers.rotary"] = rotary_mod
     sys.modules["flash_attn.flash_attn_interface"] = interface_mod
+
+
+_patch()
 ```
 
 This code allows to run inference of AIFS on any GPU or CPU. 
@@ -150,6 +120,11 @@ AIFS needs two consecutive 6-hour analyses as input: **t-6h** and **t**.
 We pull them from [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data)
 — free, no account required.
 
+Multiple datasets are downloaded at this step. Once downloaded for the first time, each dataset is stored in cache. 
+The first download takes a few minutes. 
+Then, loading the data from the cache only takes a few seconds. 
+
+During the initial download, ratelimits and errors sometimes occur. If you're getting an error during the downloading of the data, just wait a few seconds and try again. 
 ```python
 from aifs import load_ics
 
