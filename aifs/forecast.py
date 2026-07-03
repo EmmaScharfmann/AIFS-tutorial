@@ -199,13 +199,12 @@ def _load_forecast_nc(path: str):
     ds = xr.open_dataset(path)
     lat = ds["latitudes"].values
     lon = ds["longitudes"].values
-    var_names = [v for v in ds.data_vars]
 
     states = []
     for i, t in enumerate(ds["date"].values):
         date = pd.Timestamp(t).to_pydatetime()
 
-        fields = {var: ds[var].isel(time=i).values for var in var_names}
+        fields = {var: ds[var].isel(date=i).values for var in ds.keys()}
 
         states.append({
             "date": date,
