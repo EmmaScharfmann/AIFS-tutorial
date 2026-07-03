@@ -12,74 +12,6 @@ import torch.nn.functional as F
 
 # ── SDPA-based attention replacement ─────────────────────────────────────────
 
-def _window_bounds(seq_len, left, right, causal, device):
-    """
-    Build the per-query (lower, upper) inclusive key bounds implied by
-    ``window_size=(left, right)`` and ``causal``, following flash-attn semantics:
-
-    - left  < 0  -> no lower-bound restriction from the window
-    - right < 0  -> no upper-bound restriction from the window
-    - causal=True additionally forces key <= query, regardless of `right`
-    """
-    idx = torch.arange(seq_len, device=device)
-    lower = torch.zeros(seq_len, dtype=torch.long, device=device) if left < 0 else torch.clamp(idx - left, min=0)
-    if causal:
-        upper = idx.clone()
-    elif right < 0:
-        upper = torch.full((seq_len,), seq_len - 1, dtype=torch.long, device=device)
-    else:
-        upper = torch.clamp(idx + right, max=seq_len - 1)
-    return lower, upper
-
-
-def _masked_attention(q, k, v, lower, upper, dropout_p, softmax_scale):
-    """
-    Full (non-chunked) windowed/causal attention via an explicit boolean mask.
-    q, k, v: (B, H, S, D). lower/upper: (S,) per-query inclusive key bounds.
-    Suitable when S is small enough that an S x S bool mask is affordable.
-    """
-    S = q.shape[-2]
-    key_idx = torch.arange(S, device=q.device).view(1, S)          # (1, S)
-    allowed = (key_idx >= lower.view(S, 1)) & (key_idx <= upper.view(S, 1))  # (S, S)
-    return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=allowed, dropout_p=dropout_p, scale=softmax_scale
-    )
-
-
-def _chunked_windowed_attention(q, k, v, left, right, causal, dropout_p, softmax_scale, chunk_size):
-    """
-    Memory-friendly windowed/causal attention: iterate over query chunks and
-    only materialize the (small) slice of keys/values each chunk can attend
-    to, with a per-row mask inside that slice to get exact bounds right.
-    """
-    B, H, S, D = q.shape
-    out = torch.empty_like(q)
-    lower_full, upper_full = _window_bounds(S, left, right, causal, q.device)
-
-    for qs in range(0, S, chunk_size):
-        qe = min(S, qs + chunk_size)
-
-        # Superset of keys any query in [qs, qe) could need.
-        k_start = int(lower_full[qs:qe].min().item())
-        k_end = int(upper_full[qs:qe].max().item()) + 1
-
-        q_chunk = q[:, :, qs:qe]
-        k_chunk = k[:, :, k_start:k_end]
-        v_chunk = v[:, :, k_start:k_end]
-
-        # Per-row mask within this (small) chunk to enforce exact bounds.
-        key_idx = torch.arange(k_start, k_end, device=q.device).view(1, -1)
-        lower_c = lower_full[qs:qe].view(-1, 1)
-        upper_c = upper_full[qs:qe].view(-1, 1)
-        allowed = (key_idx >= lower_c) & (key_idx <= upper_c)
-
-        out[:, :, qs:qe] = F.scaled_dot_product_attention(
-            q_chunk, k_chunk, v_chunk, attn_mask=allowed, dropout_p=dropout_p, scale=softmax_scale
-        )
-
-    return out
-
-
 def _sdpa_compat(
     q,
     k,
@@ -110,50 +42,29 @@ def _sdpa_compat(
     # flash-attn layout: (B, S, H, D)  →  SDPA layout: (B, H, S, D)
     q, k, v = (t.permute(0, 2, 1, 3) for t in (q, k, v))
 
-    if isinstance(window_size, (tuple, list)):
-        left, right = window_size
-    else:
-        left = right = int(window_size)
+    left, right = window_size
+
 
     S = q.shape[-2]
-    no_window = left < 0 and right < 0
 
     if q.device.type == "cuda":
-        if no_window:
-            # Full attention; SDPA dispatches to a flash-attn kernel when available.
-            out = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
-            )
-        else:
-            # Windowed: chunk to bound peak memory, even though CUDA could
-            # often afford a full S x S mask.
-            out = _chunked_windowed_attention(
-                q, k, v, left, right, causal, dropout_p, softmax_scale, chunk_size=2048
-            )
+        out = _chunked_windowed_attention(
+            q, k, v, left, right, causal, dropout_p, softmax_scale, chunk_size=2048
+        )
 
     elif q.device.type == "mps":
-        if no_window:
-            out = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
-            )
-        else:
-            # MPS: chunked to avoid OOM on large sequences.
-            chunk = max(left if left > 0 else 0, right if right > 0 else 0) or 512
-            out = _chunked_windowed_attention(
-                q, k, v, left, right, causal, dropout_p, softmax_scale, chunk_size=chunk
-            )
+        # MPS: chunked to avoid OOM on large sequences.
+        chunk = max(left if left > 0 else 0, right if right > 0 else 0) or 512
+        out = _chunked_windowed_attention(
+            q, k, v, left, right, causal, dropout_p, softmax_scale, chunk_size=chunk
+        )
 
     else:
         # CPU fallback — move to CPU in case tensors are on an unsupported device.
         q_cpu, k_cpu, v_cpu = q.cpu(), k.cpu(), v.cpu()
-        if no_window:
-            out = F.scaled_dot_product_attention(
-                q_cpu, k_cpu, v_cpu, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale
-            )
-        else:
-            out = _chunked_windowed_attention(
-                q_cpu, k_cpu, v_cpu, left, right, causal, dropout_p, softmax_scale, chunk_size=1024
-            )
+        out = _chunked_windowed_attention(
+            q_cpu, k_cpu, v_cpu, left, right, causal, dropout_p, softmax_scale, chunk_size=1024
+        )
         out = out.to(q.device)
 
     if q.device.type == "cuda":
@@ -164,7 +75,53 @@ def _sdpa_compat(
     return out.permute(0, 2, 1, 3)
 
 
-# ── Build stub modules ────────────────────────────────────────────────────────
+
+def _window_bounds(seq_len, left, right, device):
+    """
+    Build the per-query (lower, upper) inclusive key bounds implied by
+    ``window_size=(left, right)`` following flash-attn semantics:
+    """
+    idx = torch.arange(seq_len, device=device)
+    lower = torch.clamp(idx - left, min=0)
+    upper = torch.clamp(idx + right, max=seq_len - 1)
+    return lower, upper
+
+
+def _chunked_windowed_attention(q, k, v, left, right, causal, dropout_p, softmax_scale, chunk_size):
+    """
+    Memory-friendly windowed/causal attention: iterate over query chunks and
+    only materialize the (small) slice of keys/values each chunk can attend
+    to, with a per-row mask inside that slice to get exact bounds right.
+    """
+    B, H, S, D = q.shape
+    out = torch.empty_like(q)
+    lower_full, upper_full = _window_bounds(S, left, right, q.device)
+
+    for qs in range(0, S, chunk_size):
+        qe = min(S, qs + chunk_size)
+
+        # Superset of keys any query in [qs, qe) could need.
+        k_start = int(lower_full[qs:qe].min().item())
+        k_end = int(upper_full[qs:qe].max().item()) + 1
+
+        q_chunk = q[:, :, qs:qe]
+        k_chunk = k[:, :, k_start:k_end]
+        v_chunk = v[:, :, k_start:k_end]
+
+        # Per-row mask within this (small) chunk to enforce exact bounds.
+        key_idx = torch.arange(k_start, k_end, device=q.device).view(1, -1)
+        lower_c = lower_full[qs:qe].view(-1, 1)
+        upper_c = upper_full[qs:qe].view(-1, 1)
+        allowed = (key_idx >= lower_c) & (key_idx <= upper_c)
+
+        out[:, :, qs:qe] = F.scaled_dot_product_attention(
+            q_chunk, k_chunk, v_chunk, attn_mask=allowed, dropout_p=dropout_p, scale=softmax_scale
+        )
+
+    return out
+
+
+# ── Build modules ────────────────────────────────────────────────────────
 
 def _patch():
     """Install the flash_attn stub into ``sys.modules``."""
@@ -173,7 +130,7 @@ def _patch():
 
     flash_attn = types.ModuleType("flash_attn")
     flash_attn.__version__ = "2.6.0"  # version Anemoi checks against
-    flash_attn.flash_attn_func = _sdpa_compat  # top-level re-export, matches real package
+    flash_attn.flash_attn_func = _sdpa_compat
 
     # flash_attn.layers.rotary  (imported but only used on specific GPU paths)
     layers_mod = types.ModuleType("flash_attn.layers")
@@ -189,7 +146,7 @@ def _patch():
     layers_mod.rotary = rotary_mod
     flash_attn.layers = layers_mod
 
-    # flash_attn.flash_attn_interface  (the one Anemoi actually calls)
+    # flash_attn.flash_attn_interface
     interface_mod = types.ModuleType("flash_attn.flash_attn_interface")
     interface_mod.flash_attn_func = _sdpa_compat
     flash_attn.flash_attn_interface = interface_mod

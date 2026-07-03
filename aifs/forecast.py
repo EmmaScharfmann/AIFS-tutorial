@@ -2,6 +2,10 @@ import os
 import datetime
 from typing import Generator
 
+import numpy as np
+import pandas as pd
+import xarray as xr
+
 # Apply flash-attn shim before any anemoi import
 import aifs.compat  # noqa: F401
 from aifs.device import get_device, device_label
@@ -133,3 +137,109 @@ def run_forecast_streaming(
             "date": state["date"],
             "fields": {k: v.copy() for k, v in state["fields"].items()}
     }
+
+
+def save_forecast(states: list[dict], path: str = '../forecasts/output.nc'):
+    """
+    Save the results of the forecasts as .nc file.
+
+    :param states: list of state dicts, one per 6-hour output step.
+                   Each state dict has at minimum:
+                        ``state["date"]``   — output datetime
+                        ``state["fields"]`` — ``{variable: np.ndarray}``
+                        ``state["latitudes"]``
+                        ``state["longitudes"]``
+    :param path:   path to save the states.
+    """
+    dates = [s["date"] for s in states]
+    lat = states[0]["latitudes"]
+    lon = states[0]["longitudes"]
+
+    var_names = states[0]["fields"].keys()
+    data_vars = {}
+
+    for var in var_names:
+        arr = np.stack([s["fields"][var] for s in states], axis=0)
+        data_vars[var] = (["date", "values"], arr)
+
+    ds = xr.Dataset(
+        data_vars,
+        coords={
+            "date": dates,
+            "latitudes": ("values", lat),
+            "longitudes": ("values", lon),
+        },
+    )
+    ds.to_netcdf(path)
+
+
+def load_forecast(path: str):
+    """
+    Load the results of the forecasts, saved as either a .nc or .npz file.
+
+    :param path:   path of the .nc or .npz file to load.
+    :return:       list of state dicts, one per 6-hour output step.
+                   Each state dict has at minimum:
+                        ``state["date"]``   — output datetime
+                        ``state["fields"]`` — ``{variable: np.ndarray}``
+                        ``state["latitudes"]``
+                        ``state["longitudes"]``
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".nc":
+        return _load_forecast_nc(path)
+    elif ext == ".npz":
+        return _load_forecast_npz(path)
+    else:
+        raise ValueError(f"Unsupported file extension: {ext!r} (expected .nc or .npz)")
+
+
+def _load_forecast_nc(path: str):
+    ds = xr.open_dataset(path)
+    lat = ds["latitudes"].values
+    lon = ds["longitudes"].values
+    var_names = [v for v in ds.data_vars]
+
+    states = []
+    for i, t in enumerate(ds["date"].values):
+        date = pd.Timestamp(t).to_pydatetime()
+
+        fields = {var: ds[var].isel(time=i).values for var in var_names}
+
+        states.append({
+            "date": date,
+            "fields": fields,
+            "latitudes": lat,
+            "longitudes": lon,
+        })
+
+    ds.close()
+    return states
+
+
+def _load_forecast_npz(path: str):
+    data = np.load(path, allow_pickle=True)
+
+    lat = data["latitudes"]
+    lon = data["longitudes"]
+    dates_raw = data["date"]
+
+    if dates_raw.ndim == 0:
+        dates_raw = dates_raw.item()
+    dates_raw = np.atleast_1d(dates_raw)
+
+    meta_keys = {"latitudes", "longitudes", "date"}
+    var_names = [k for k in data.files if k not in meta_keys]
+
+    states = []
+    for i, t in enumerate(dates_raw):
+        date = pd.Timestamp(str(t)).to_pydatetime()
+        states.append({
+            "date": date,
+            "fields": { k.replace("field_", "") : data[k] for k,v in data.items() } ,
+            "latitudes": lat,
+            "longitudes": lon,
+        })
+
+    return states

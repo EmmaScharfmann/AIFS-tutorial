@@ -8,7 +8,7 @@ However, ```anemoi-inference``` default installation depends on [`flash-attn`](h
 which only compiles on **Ampere-class NVIDIA GPUs** (A100, H100, RTX 30xx+).
 For anyone without that specific hardware, installing ```flash-attn``` and dealing with ```anemoi``` dependencies are the main barriers to running inference.
 
-Therefore, we developed this tutorial and a lightweight wrapper to simplify running [aifs-single-2.0](https://huggingface.co/ecmwf/aifs-single-2.0) with ```anemoi-inference``` on any hardware.
+Therefore, we developed this tutorial and a lightweight wrapper to simplify running [aifs-single-2.0](https://huggingface.co/ecmwf/aifs-single-2.0) with ```anemoi-inference``` locally on any GPUs or CPUs or using Hugging Face jobs. 
 
 ---
 
@@ -30,7 +30,9 @@ Our wrapper intercepts Anemoi's `flash_attn` import and routes it to SDPA.
 
 ---
 
-## Setup
+## Running the forecasts locally
+
+### Local setup
 
 **Requirements:** Python ≥3.11, <3.13
 
@@ -54,7 +56,7 @@ anemoi-inference
 
 ---
 
-## How it works
+### How it works
 
 The wrapper lives in `aifs/compat.py`.  It creates a fake `flash_attn`
 module tree and registers it in `sys.modules` *before* any Anemoi import
@@ -102,9 +104,9 @@ This code allows to run inference of AIFS on any GPU or CPU.
 
 ---
 
-## Step-by-Step Tutorial
+### Step-by-Step Tutorial
 
-### 1. Check Your Device
+#### 1. Check Your Device
 
 ```python
 from aifs import get_device, device_label
@@ -114,7 +116,7 @@ print(device_label())
 # → "CPU (no GPU detected — inference will be slow)"
 ```
 
-### 2. Download Initial Conditions
+#### 2. Download Initial Conditions
 
 AIFS needs two consecutive 6-hour analyses as input: **t-6h** and **t**.
 We pull them from [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data)
@@ -139,7 +141,7 @@ print(fields["2t"].shape)
 **Fields downloaded**: surface, soil, ocean waves,
 pressure levels, plus derived quantities (geopotential, wave direction components).
 
-### 3. Run a Forecast
+#### 3. Run a Forecast
 
 ```python
 from aifs import run_forecast
@@ -164,7 +166,7 @@ for state in states:
 # 2025-01-16 00:00:00   14.29 °C
 ```
 
-### 4. Plot Forecast Fields
+#### 4. Plot Forecast Fields
 
 ```python
 from aifs import plot_field, plot_field_sequence
@@ -187,7 +189,7 @@ print(PLOTTABLE)
 #  't_850', 't_500', 'u_850', 'v_850', 'z_500', 'q_700']
 ```
 
-### 5. CLI Usage
+#### 5. CLI Usage
 
 ```bash
 # 24-hour forecast, save plots to ./outputs/
@@ -203,7 +205,7 @@ python run_forecast.py --list-cache
 python run_forecast.py --force-download
 ```
 
-### 6. Streaming for Long Runs
+#### 6. Streaming for Long Runs
 
 ```python
 from aifs import run_forecast_streaming
@@ -212,6 +214,53 @@ for state in run_forecast_streaming(fields, date, lead_time=120):
     t = state["fields"]["2t"].mean() - 273.15
     print(f"{state['date']}  global mean T2m = {t:.2f} °C")
 ```
+## Running the forecast using Hugging Face jobs
+
+If you don't have access to a GPU / CPU or to enough storage, you can run the forecast directly using Hugging Face jobs. 
+You can find more details about [Hugging Face jobs](https://huggingface.co/docs/hub/en/jobs-quickstart) and the [pricing](https://huggingface.co/docs/hub/en/jobs-pricing).
+
+### Getting started with Hugging Face jobs
+
+First install the Hugging Face CLI:
+
+#### 1. Install the CLI
+Recommended approach:
+
+```curl -LsSf https://hf.co/cli/install.sh | bash```
+
+Or using Homebrew:
+
+```brew install hf```
+
+Or using uv:
+
+```uv tool install hf```
+
+#### 2. Create a dataset to host your results
+
+Create a dataset named `aifs-results` in your HF organization which will store the results of the forecast. 
+
+
+#### 3. Login to your Hugging Face account
+
+Create an access token following the [documentation](https://huggingface.co/docs/hub/en/security-tokens). Grant the token with a read / write right on your organization  `aifs-results` and the permission to manage jobs. 
+
+
+#### 4. Run the forecast 
+
+```
+hf jobs run \
+  --flavor t4-small \
+  --secrets HF_TOKEN=$HF_TOKEN \
+  pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel \
+  bash -c "python -c \"import urllib.request; urllib.request.urlretrieve('https://github.com/EmmaScharfmann/AIFS-tutorial/archive/refs/heads/main.tar.gz', 'repo.tar.gz')\" && \
+           tar xzf repo.tar.gz && mv AIFS-tutorial-main /app && cd /app && \
+           pip install -r requirements.txt huggingface_hub && \
+           python run_forecast.py --lead-time 48 --no-plots --dataset-repo your-hf-username/aifs-results"
+```
+
+You can fine more details about Hugging Face jobs [here](https://huggingface.co/docs/hub/en/jobs).
+
 
 ---
 

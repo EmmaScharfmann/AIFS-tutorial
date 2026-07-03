@@ -1,6 +1,8 @@
 torch>=2.1.0
 numpy>=1.24
 huggingface_hub
+pandas
+xarray
 
 anemoi-models==0.9.3
 anemoi-transform==0.4.2
